@@ -189,6 +189,7 @@ export default class Term extends React.PureComponent<TermProps> {
     }
 
     this.fitAddon.fit();
+    this.setupSmoothScroll();
 
     if (this.props.isTermActive) {
       this.term.focus();
@@ -328,6 +329,35 @@ export default class Term extends React.PureComponent<TermProps> {
     this.fitAddon.fit();
   }
 
+  setupSmoothScroll() {
+    const viewport = this.termRef?.querySelector('.xterm-viewport') as HTMLElement;
+    const screen = this.termRef?.querySelector('.xterm-screen') as HTMLElement;
+    if (!viewport || !screen) return;
+
+    // Promote to compositing layer for GPU-accelerated transforms
+    screen.style.willChange = 'transform';
+
+    this.smoothScrollHandler = () => {
+      // Disable smooth scroll for TUI apps (vim, tmux, less, htop, etc.)
+      // They use the alternate buffer and handle scrolling themselves via escape sequences
+      if (this.term.buffer.active.type === 'alternate') {
+        screen.style.transform = '';
+        return;
+      }
+
+      const cellHeight = (this.term as any)._core._renderService.dimensions.css.cell.height;
+      if (!cellHeight) return;
+
+      const scrollTop = viewport.scrollTop;
+      // Match xterm.js's Math.round rounding to calculate the correct sub-line offset
+      const renderedRow = Math.round(scrollTop / cellHeight);
+      const offset = scrollTop - renderedRow * cellHeight;
+      screen.style.transform = `translateY(${-offset}px)`;
+    };
+
+    viewport.addEventListener('scroll', this.smoothScrollHandler);
+  }
+
   keyboardHandler(e: any) {
     // Has Mousetrap flagged this event as a command?
     return !e.catched;
@@ -419,6 +449,12 @@ export default class Term extends React.PureComponent<TermProps> {
     // to do in case of splitting, see `componentDidMount`
     this.disposableListeners.forEach((handler) => handler.dispose());
     this.disposableListeners = [];
+
+    if (this.smoothScrollHandler) {
+      const viewport = this.termRef?.querySelector('.xterm-viewport');
+      viewport?.removeEventListener('scroll', this.smoothScrollHandler);
+      this.smoothScrollHandler = null;
+    }
 
     window.removeEventListener('paste', this.onWindowPaste, {
       capture: true
