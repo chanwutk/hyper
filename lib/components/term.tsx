@@ -16,6 +16,18 @@ import {ObjectTypedKeys} from '../utils/object';
 
 const isWindows = ['Windows', 'Win16', 'Win32', 'WinCE'].includes(navigator.platform);
 
+// Describe the subset of xterm's internal render service used to calculate smooth-scroll offsets.
+type SmoothScrollRenderService = {
+  dimensions: {
+    css: {
+      cell: {
+        height: number;
+      };
+    };
+  };
+  onDimensionsChange: (listener: () => void) => IDisposable;
+};
+
 // map old hterm constants to xterm.js
 const CURSOR_STYLES = {
   BEAM: 'bar',
@@ -94,6 +106,19 @@ export default class Term extends React.PureComponent<TermProps> {
   term!: Terminal;
   resizeObserver!: ResizeObserver;
   resizeTimeout!: NodeJS.Timeout;
+  // Keep the active scroll listener for the normal buffer.
+  smoothScrollHandler: (() => void) | null;
+  // Keep the alternate-buffer listener that simply clears any active transform.
+  smoothScrollAlternateHandler: (() => void) | null;
+  // Track whichever scroll listener is currently attached to the viewport.
+  smoothScrollViewportHandler: (() => void) | null;
+  // Cache the rendered cell height so sub-line offsets can be computed from scrollTop.
+  smoothScrollCellHeight: number | null;
+  // Cache the xterm viewport element used for scroll events.
+  smoothScrollViewport: HTMLElement | null;
+  // Cache the xterm screen element that receives the translateY transform.
+  smoothScrollScreen: HTMLElement | null;
+
   constructor(props: TermProps) {
     super(props);
     props.ref_(props.uid, this);
@@ -102,6 +127,13 @@ export default class Term extends React.PureComponent<TermProps> {
     this.termOptions = {};
     this.disposableListeners = [];
     this.termDefaultBellSound = null;
+    // Initialize the smooth-scroll state before the terminal DOM is mounted.
+    this.smoothScrollHandler = null;
+    this.smoothScrollAlternateHandler = null;
+    this.smoothScrollViewportHandler = null;
+    this.smoothScrollCellHeight = null;
+    this.smoothScrollViewport = null;
+    this.smoothScrollScreen = null;
     this.fitAddon = new FitAddon();
     this.searchAddon = new SearchAddon();
   }
@@ -189,6 +221,7 @@ export default class Term extends React.PureComponent<TermProps> {
     }
 
     this.fitAddon.fit();
+    // Wire the DOM-based smooth-scroll transform after xterm has been opened and sized.
     this.setupSmoothScroll();
 
     if (this.props.isTermActive) {
@@ -329,33 +362,120 @@ export default class Term extends React.PureComponent<TermProps> {
     this.fitAddon.fit();
   }
 
+  getSmoothScrollRenderService(): SmoothScrollRenderService | undefined {
+    // Reach into xterm internals to access the render metrics used by the smooth-scroll logic.
+    return (this.term as any)._core?._renderService as SmoothScrollRenderService | undefined;
+  }
+
+  updateSmoothScrollCellHeight() {
+    // Read the current rendered cell height so scroll offsets stay aligned with xterm's layout.
+    const cellHeight = this.getSmoothScrollRenderService()?.dimensions.css.cell.height;
+    // Cache the latest cell height, or clear it when the render service cannot provide one.
+    this.smoothScrollCellHeight = cellHeight || null;
+
+    if (!this.smoothScrollCellHeight) {
+      // Reset any previous transform when a valid cell height is unavailable.
+      this.clearSmoothScrollTransform();
+      return;
+    }
+
+    // Re-run the active scroll handler so the transform uses the latest measurements.
+    this.smoothScrollViewportHandler?.();
+  }
+
+  clearSmoothScrollTransform() {
+    if (this.smoothScrollScreen) {
+      // Remove the translateY adjustment so the screen snaps back to xterm's base position.
+      this.smoothScrollScreen.style.transform = '';
+    }
+  }
+
+  setSmoothScrollViewportHandler(handler: (() => void) | null) {
+    if (!this.smoothScrollViewport) {
+      return;
+    }
+
+    if (this.smoothScrollViewportHandler) {
+      // Detach the previous scroll listener before swapping handlers.
+      this.smoothScrollViewport.removeEventListener('scroll', this.smoothScrollViewportHandler);
+    }
+
+    if (handler) {
+      // Attach the new scroll listener for the currently active buffer mode.
+      this.smoothScrollViewport.addEventListener('scroll', handler);
+    }
+
+    // Remember which handler is currently bound so it can be updated or removed later.
+    this.smoothScrollViewportHandler = handler;
+  }
+
+  updateSmoothScrollViewportHandler() {
+    if (this.term.buffer.active.type === 'alternate') {
+      // Disable the smooth-scroll transform in the alternate buffer to avoid offsetting full-screen apps.
+      this.clearSmoothScrollTransform();
+      this.setSmoothScrollViewportHandler(this.smoothScrollAlternateHandler);
+      return;
+    }
+
+    // Use the normal smooth-scroll handler for the primary scrollback buffer.
+    this.setSmoothScrollViewportHandler(this.smoothScrollHandler);
+    // Immediately sync the transform with the viewport's current scroll position.
+    this.smoothScrollViewportHandler?.();
+  }
+
   setupSmoothScroll() {
+    // Locate the xterm viewport and screen nodes needed to observe scrolling and apply transforms.
     const viewport = this.termRef?.querySelector('.xterm-viewport') as HTMLElement;
     const screen = this.termRef?.querySelector('.xterm-screen') as HTMLElement;
-    if (!viewport || !screen) return;
+    // Read xterm's render service so the transform can stay aligned with rendered cell metrics.
+    const renderService = this.getSmoothScrollRenderService();
+    // Abort setup when any required DOM node or render metric source is unavailable.
+    if (!viewport || !screen || !renderService) return;
+
+    // Cache the viewport node for listener management and cleanup.
+    this.smoothScrollViewport = viewport;
+    // Cache the screen node because that is the element translated during smooth scrolling.
+    this.smoothScrollScreen = screen;
 
     // Promote to compositing layer for GPU-accelerated transforms
     screen.style.willChange = 'transform';
 
     this.smoothScrollHandler = () => {
-      // Disable smooth scroll for TUI apps (vim, tmux, less, htop, etc.)
-      // They use the alternate buffer and handle scrolling themselves via escape sequences
-      if (this.term.buffer.active.type === 'alternate') {
-        screen.style.transform = '';
-        return;
-      }
+      // if (!this.smoothScrollCellHeight) {
+      //   this.clearSmoothScrollTransform();
+      //   return;
+      // }
 
-      const cellHeight = (this.term as any)._core._renderService.dimensions.css.cell.height;
-      if (!cellHeight) return;
-
+      // Read the viewport scroll position that xterm has already applied.
       const scrollTop = viewport.scrollTop;
       // Match xterm.js's Math.round rounding to calculate the correct sub-line offset
-      const renderedRow = Math.round(scrollTop / cellHeight);
-      const offset = scrollTop - renderedRow * cellHeight;
+      const renderedRow = Math.round(scrollTop / (this.smoothScrollCellHeight as number));
+      // Compute the remaining fractional offset that should be smoothed with a transform.
+      const offset = scrollTop - renderedRow * (this.smoothScrollCellHeight as number);
+      // Translate the screen by the inverse fractional offset to smooth the row transition.
       screen.style.transform = `translateY(${-offset}px)`;
     };
+    this.smoothScrollAlternateHandler = () => {
+      // Keep alternate-buffer content anchored to xterm's native positioning.
+      this.clearSmoothScrollTransform();
+    };
 
-    viewport.addEventListener('scroll', this.smoothScrollHandler);
+    // Prime the cached cell height before any scroll events are processed.
+    this.updateSmoothScrollCellHeight();
+    this.disposableListeners.push(
+      renderService.onDimensionsChange(() => {
+        // Recalculate the cached cell height whenever xterm's render metrics change.
+        this.updateSmoothScrollCellHeight();
+      })
+    );
+    this.disposableListeners.push(
+      this.term.buffer.onBufferChange(() => {
+        // Swap scroll handlers when xterm switches between the normal and alternate buffers.
+        this.updateSmoothScrollViewportHandler();
+      })
+    );
+    // Attach the correct initial scroll listener for the buffer that is active right now.
+    this.updateSmoothScrollViewportHandler();
   }
 
   keyboardHandler(e: any) {
@@ -450,11 +570,22 @@ export default class Term extends React.PureComponent<TermProps> {
     this.disposableListeners.forEach((handler) => handler.dispose());
     this.disposableListeners = [];
 
-    if (this.smoothScrollHandler) {
-      const viewport = this.termRef?.querySelector('.xterm-viewport');
-      viewport?.removeEventListener('scroll', this.smoothScrollHandler);
-      this.smoothScrollHandler = null;
+    if (this.smoothScrollViewportHandler && this.smoothScrollViewport) {
+      // Remove the viewport listener so the detached terminal no longer receives scroll callbacks.
+      this.smoothScrollViewport.removeEventListener('scroll', this.smoothScrollViewportHandler);
     }
+    // Clear any remaining transform before releasing the screen node reference.
+    this.smoothScrollScreen?.style.removeProperty('transform');
+    // Remove the compositing hint that was added during smooth-scroll setup.
+    this.smoothScrollScreen?.style.removeProperty('will-change');
+    // Drop all smooth-scroll callbacks so unmounted instances cannot be reused accidentally.
+    this.smoothScrollHandler = null;
+    this.smoothScrollAlternateHandler = null;
+    this.smoothScrollViewportHandler = null;
+    // Clear the cached measurements and DOM nodes associated with smooth scrolling.
+    this.smoothScrollCellHeight = null;
+    this.smoothScrollViewport = null;
+    this.smoothScrollScreen = null;
 
     window.removeEventListener('paste', this.onWindowPaste, {
       capture: true
