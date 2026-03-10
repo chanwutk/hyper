@@ -19,11 +19,7 @@ const isWindows = ['Windows', 'Win16', 'Win32', 'WinCE'].includes(navigator.plat
 // Describe the subset of xterm's internal render service used to calculate smooth-scroll offsets.
 type SmoothScrollRenderService = {
   dimensions: {
-    css: {
-      cell: {
-        height: number;
-      };
-    };
+    actualCellHeight: number;
   };
   onDimensionsChange: (listener: () => void) => IDisposable;
 };
@@ -369,7 +365,7 @@ export default class Term extends React.PureComponent<TermProps> {
 
   updateSmoothScrollCellHeight() {
     // Read the current rendered cell height so scroll offsets stay aligned with xterm's layout.
-    const cellHeight = this.getSmoothScrollRenderService()?.dimensions.css.cell.height;
+    const cellHeight = this.getSmoothScrollRenderService()?.dimensions.actualCellHeight;
     // Cache the latest cell height, or clear it when the render service cannot provide one.
     this.smoothScrollCellHeight = cellHeight || null;
 
